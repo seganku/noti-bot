@@ -7,7 +7,8 @@ Provides a confirmation prompt for unbounded repeating schedules.
 import nextcord
 from nextcord import ui, ButtonStyle
 from bot_context import db, scheduler, noti_group
-from utils import log_message, parse_interval, validate_interval
+from utils import log_message, parse_interval, validate_interval, interval_to_timedelta
+from config import DELIVER_LATE
 from datetime import datetime, timedelta, UTC
 
 class ConfirmView(ui.View):
@@ -67,6 +68,7 @@ async def add_notification(
     - interval, end_time, max_occurrences: optional repeat bounds.
     """
     db.ensure_connection()
+    now = datetime.now(UTC)
     await interaction.response.send_message("⌛ Processing...", ephemeral=True)
 
     # Parse and validate time
@@ -85,6 +87,26 @@ async def add_notification(
             return await interaction.edit_original_message(content="❌ Invalid interval.")
         is_repeating = True
 
+    # For one-off: still require a future time
+    if not is_repeating:
+        if start_time <= now + timedelta(seconds=5):
+            return await interaction.edit_original_message(content="❌ Time must be in the future.")
+
+    # For repeating: allow past start_time. Precompute initial last_triggered so the scheduler
+    # can catch up (if within DELIVER_LATE) or schedule the next future run.
+    initial_last_triggered = None
+    if is_repeating:
+        delta = interval_to_timedelta(iv_val, iv_unit)
+        if delta is None:
+            return await interaction.edit_original_message(content="❌ Invalid interval.")
+        if start_time <= now:
+            # last occurrence at or before 'now'
+            elapsed = now - start_time
+            n = int(elapsed.total_seconds() // delta.total_seconds())
+            last_occ = start_time + n * delta
+            # seed last_triggered so next target is 'last_occ'
+            initial_last_triggered = last_occ - delta
+
     # Parse optional end_time
     end_dt = None
     if end_time:
@@ -96,29 +118,33 @@ async def add_notification(
 
     # Warning for unbounded repeats
     if is_repeating and not end_dt and not max_occurrences:
-        warn = "⚠️ Unbounded repeating: confirm?"
+        warn = (
+            "⚠️ Unbounded repeating schedule detected.\n\n"
+            "• This notification will repeat indefinitely (no end time or max repeats).\n"
+            "• Repeating schedules may start in the past. If the most recent occurrence is "
+            f"within your DELIVER_LATE window ({DELIVER_LATE}), it will be delivered as a "
+            "catch-up; otherwise, the next future occurrence will be scheduled.\n\n"
+            "Do you want to proceed?"
+        )
         view = ConfirmView(interaction.user.id)
         await interaction.edit_original_message(content=warn, view=view)
         await view.wait()
         if not view.confirmed:
             return
 
-    now = datetime.now(UTC)
-    if start_time <= now + timedelta(seconds=5) and not is_repeating:
-        return await interaction.edit_original_message(content="❌ Time must be in the future for non-repeating notifications.")
-
     # Insert DB
     cur = db.conn.cursor()
     if is_repeating:
         cur.execute(
             'INSERT INTO noti (guild_id,channel_id,user_id,start_time,message,'
-            'is_repeating,interval_value,interval_unit,end_time,max_occurrences)'
-            ' VALUES (?,?,?,?,?,?,?,?,?,?)',
+            'is_repeating,interval_value,interval_unit,end_time,max_occurrences,last_triggered)'
+            ' VALUES (?,?,?,?,?,?,?,?,?,?,?)',
             (interaction.guild.id, channel.id, interaction.user.id,
              start_time.isoformat(), message,
              True, iv_val, iv_unit,
              end_dt.isoformat() if end_dt else None,
-             max_occurrences)
+             max_occurrences,
+             initial_last_triggered.isoformat() if initial_last_triggered else None)
         )
     else:
         cur.execute(

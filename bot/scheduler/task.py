@@ -80,7 +80,7 @@ class NotificationTask:
                 next_time = last + self.config.interval_delta
                 while next_time <= now and (now - next_time) <= DELIVER_LATE:
                     try:
-                        await self._dispatch_at(next_time)
+                        await self._dispatch(next_time)
                         self.run_count += 1
                     except Exception as e:
                         log_message(
@@ -128,8 +128,8 @@ class NotificationTask:
                         )
                 # Wait until dispatch time
                 await self._wait_until(scheduled_time)
-                # Dispatch
-                await self._dispatch()
+                # Dispatch this occurrence at its scheduled time
+                await self._dispatch(scheduled_time)
                 occurrence_count += 1
 
                 # Stop conditions
@@ -150,17 +150,6 @@ class NotificationTask:
         except Exception as e:
             log_message(f"Error in NotificationTask {self.config.notif_id}: {e}", "error")
 
-    async def _dispatch_at(self, when):
-        """
-        Dispatch a notification as if at a past time (for catch-up purposes).
-
-        Temporarily overrides config.start_time for correct logging.
-        """
-        orig = self.config.start_time
-        self.config.start_time = when
-        await self._dispatch()
-        self.config.start_time = orig
-
     async def _wait_until(self, target_time):
         """
         Sleep until the specified UTC datetime.
@@ -173,7 +162,7 @@ class NotificationTask:
         if delay > 0:
             await asyncio.sleep(delay)
 
-    async def _dispatch(self):
+    async def _dispatch(self, when):
         from bot_context import avatar_cache
         """
         Send the notification using a webhook, retrying up to DELIVER_LATE.
@@ -189,9 +178,10 @@ class NotificationTask:
         if not channel:
             return
 
-        deadline = self.config.start_time + DELIVER_LATE
-        #while datetime.now(UTC) < deadline:
-        if datetime.now(UTC) < deadline:
+        # Compute deadline relative to THIS occurrence's scheduled time
+        deadline = when + DELIVER_LATE
+        now = datetime.now(UTC)
+        if now < deadline:
             #try:
             #    webhooks = await channel.webhooks()
             #    webhook = next((w for w in webhooks if w.name=='NotiWebhook'), None)
@@ -248,20 +238,27 @@ class NotificationTask:
             #    await asyncio.sleep(5)
             try:
                 await channel.send(self.config.message)
-                log_message(f"Dispatched notification {self.config.notif_id} via channel","info")
+                log_message(
+                    f"Dispatched notification {self.config.notif_id} at {when.strftime('%Y-%m-%d %H:%M UTC')} via channel",
+                    "info"
+                )
             except Exception as exc:
                 log_message(f"Channel send failed: {exc}","error")
+            # Update last_triggered to THIS occurrence time and return
             cur = self.scheduler.db.conn.cursor()
-            cur.execute('UPDATE noti SET last_triggered = ? WHERE id = ?',
-                        (self.config.start_time.isoformat(), self.config.notif_id))
+            cur.execute(
+                'UPDATE noti SET last_triggered = ? WHERE id = ?',
+                (when.isoformat(), self.config.notif_id)
+            )
             self.scheduler.db.conn.commit()
+            return
 
         # No action after deadline; skip too‑late notifications
         # 1) Mark it as “triggered” so we don’t retry this occurrence
         cursor = self.scheduler.db.conn.cursor()
         cursor.execute(
             'UPDATE noti SET last_triggered = ? WHERE id = ?',
-            (self.config.start_time.isoformat(), self.config.notif_id)
+            (when.isoformat(), self.config.notif_id)
         )
 
         # 2) If a max_occurrences limit exists, consume one slot
@@ -282,5 +279,8 @@ class NotificationTask:
             self.scheduler.delete_record(self.config.notif_id)
 
         # Finally, bail out—no send after the deadline
+        log_message(
+            f"Skipping notification {self.config.notif_id} scheduled for {when.strftime('%Y-%m-%d %H:%M UTC')} (past DELIVER_LATE).",
+            "warning"
+        )
         return
-
