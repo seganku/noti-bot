@@ -76,10 +76,6 @@ async def add_notification(
     except ValueError:
         return await interaction.edit_original_message(content="❌ Invalid time format.")
 
-    #now = datetime.now(UTC)
-    #if start_time <= now + timedelta(seconds=5):
-    #    return await interaction.edit_original_message(content="❌ Time must be in the future.")
-
     # Determine repeating
     is_repeating = False
     iv_val = iv_unit = None
@@ -106,6 +102,10 @@ async def add_notification(
         await view.wait()
         if not view.confirmed:
             return
+
+    now = datetime.now(UTC)
+    if start_time <= now + timedelta(seconds=5) and not is_repeating:
+        return await interaction.edit_original_message(content="❌ Time must be in the future for non-repeating notifications.")
 
     # Insert DB
     cur = db.conn.cursor()
