@@ -15,6 +15,7 @@ import commands.add
 import commands.list
 import commands.delete  # alias for delete command
 import commands.help
+import commands.about
 
 @bot.event
 async def on_ready():
